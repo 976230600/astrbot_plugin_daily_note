@@ -4,7 +4,7 @@ import pathlib
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
@@ -55,7 +55,7 @@ class DailyNotePlugin(Star):
         self._init_db()
         self._schedule_task: asyncio.Task | None = None
 
-    # ── 数据库初始化 ─────────────────────────────────────
+    # ── 数据库初始化与迁移 ────────────────────────────────
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -65,12 +65,28 @@ class DailyNotePlugin(Star):
                     title TEXT NOT NULL,
                     content TEXT NOT NULL,
                     unified_msg_origin TEXT NOT NULL,
+                    cid TEXT NOT NULL DEFAULT '',
+                    history_count INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 )"""
             )
+            self._migrate_columns(conn)
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_notes_umo_time "
-                "ON daily_notes (unified_msg_origin, created_at DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_notes_umo_cid_time "
+                "ON daily_notes (unified_msg_origin, cid, created_at DESC)"
+            )
+
+    @staticmethod
+    def _migrate_columns(conn: sqlite3.Connection):
+        """兼容旧版数据库：检测并添加缺失的列。"""
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_notes)").fetchall()
+        }
+        if "cid" not in existing:
+            conn.execute("ALTER TABLE daily_notes ADD COLUMN cid TEXT NOT NULL DEFAULT ''")
+        if "history_count" not in existing:
+            conn.execute(
+                "ALTER TABLE daily_notes ADD COLUMN history_count INTEGER NOT NULL DEFAULT 0"
             )
 
     # ── 定时任务 ─────────────────────────────────────────
@@ -85,10 +101,32 @@ class DailyNotePlugin(Star):
                 pass
         self._schedule_task = asyncio.create_task(self._schedule_loop())
 
+    def _calc_next_trigger(self) -> float:
+        """计算距离下一个触发时刻的秒数。
+
+        根据 generate_hour 和 interval_days 确定下一个目标时间点。
+        """
+        hour = max(0, min(23, self.config.get("generate_hour", 22)))
+        interval_days = max(self.config.get("interval_days", 1), 1)
+
+        now = datetime.now()
+        today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+        if now >= today_target:
+            next_target = today_target + timedelta(days=interval_days)
+        else:
+            next_target = today_target
+
+        wait_sec = (next_target - now).total_seconds()
+        return max(wait_sec, 60)
+
     async def _schedule_loop(self):
         while True:
-            interval_days = max(self.config.get("interval_days", 1), 1)
-            await asyncio.sleep(interval_days * 86400)
+            wait_sec = self._calc_next_trigger()
+            logger.info(
+                f"[daily_note] 下次自动生成将在 {wait_sec / 3600:.1f} 小时后触发"
+            )
+            await asyncio.sleep(wait_sec)
             try:
                 await self._generate_all_sessions()
             except Exception as e:
@@ -155,6 +193,14 @@ class DailyNotePlugin(Star):
                     f"[daily_note] cid={cid} history 非有效 JSON，按原始字符串处理"
                 )
 
+        if isinstance(history, list):
+            current_count = len(history)
+        else:
+            current_count = len(str(history))
+
+        if not skip_dedup and self._should_skip(umo, cid, current_count):
+            return False
+
         max_messages = max(self.config.get("max_messages", 50), 1)
         if isinstance(history, list):
             recent = history[-max_messages:]
@@ -163,10 +209,6 @@ class DailyNotePlugin(Star):
             chat_text = str(history)[-6000:]
 
         if not chat_text.strip():
-            return False
-
-        if not skip_dedup and self._has_recent_note(umo):
-            logger.info(f"[daily_note] umo={umo} 距上次生成间隔不足，跳过")
             return False
 
         persona_prompt = "（无特定人格，使用默认自然风格）"
@@ -212,7 +254,7 @@ class DailyNotePlugin(Star):
         resp_text = llm_resp.completion_text or ""
         title, content = self._parse_llm_response(resp_text)
         title = self._sanitize_title(title)
-        self._save_note(title, content, umo)
+        self._save_note(title, content, umo, cid, current_count)
         logger.info(f"[daily_note] 为 umo={umo} cid={cid} 生成日记: {title}")
         return True
 
@@ -265,33 +307,45 @@ class DailyNotePlugin(Star):
             title = f"日记_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         return title
 
-    # ── 增量去重 ──────────────────────────────────────────
+    # ── 去重判断 ──────────────────────────────────────────
 
-    def _has_recent_note(self, umo: str) -> bool:
-        """如果最近一篇日记距今不到设定间隔的 80%，返回 True 表示无需重新生成。"""
+    def _should_skip(self, umo: str, cid: str, current_count: int) -> bool:
+        """检查该会话是否需要跳过生成。
+
+        条件：如果该会话（umo+cid）最近一篇日记记录的 history_count
+        与当前聊天记录条数相同，说明没有新消息，跳过生成。
+        """
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
-                "SELECT created_at FROM daily_notes "
-                "WHERE unified_msg_origin = ? ORDER BY created_at DESC LIMIT 1",
-                (umo,),
+                "SELECT history_count FROM daily_notes "
+                "WHERE unified_msg_origin = ? AND cid = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (umo, cid),
             ).fetchone()
 
         if row is None:
             return False
 
-        last_created = row[0]
-        interval_days = max(self.config.get("interval_days", 1), 1)
-        threshold_sec = interval_days * 86400 * 0.8
-        return (time.time() - last_created) < threshold_sec
+        last_count = row[0]
+        if current_count <= last_count:
+            logger.info(
+                f"[daily_note] umo={umo} cid={cid} 无新消息"
+                f"（当前 {current_count} 条，上次 {last_count} 条），跳过"
+            )
+            return True
+        return False
 
     # ── 数据库操作 ────────────────────────────────────────
 
-    def _save_note(self, title: str, content: str, umo: str):
+    def _save_note(
+        self, title: str, content: str, umo: str, cid: str, history_count: int
+    ):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO daily_notes (title, content, unified_msg_origin, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (title, content, umo, int(time.time())),
+                "INSERT INTO daily_notes "
+                "(title, content, unified_msg_origin, cid, history_count, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (title, content, umo, cid, history_count, int(time.time())),
             )
 
     def _get_notes_list(self, umo: str) -> list[tuple[int, str, int]]:
