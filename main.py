@@ -86,10 +86,9 @@ class DailyNotePlugin(Star):
         self._schedule_task = asyncio.create_task(self._schedule_loop())
 
     async def _schedule_loop(self):
-        interval_days = max(self.config.get("interval_days", 1), 1)
-        interval_sec = interval_days * 86400
         while True:
-            await asyncio.sleep(interval_sec)
+            interval_days = max(self.config.get("interval_days", 1), 1)
+            await asyncio.sleep(interval_days * 86400)
             try:
                 await self._generate_all_sessions()
             except Exception as e:
@@ -210,7 +209,8 @@ class DailyNotePlugin(Star):
             prompt=full_prompt,
         )
 
-        title, content = self._parse_llm_response(llm_resp.completion_text)
+        resp_text = llm_resp.completion_text or ""
+        title, content = self._parse_llm_response(resp_text)
         title = self._sanitize_title(title)
         self._save_note(title, content, umo)
         logger.info(f"[daily_note] 为 umo={umo} cid={cid} 生成日记: {title}")
