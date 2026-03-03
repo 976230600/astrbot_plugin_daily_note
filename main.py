@@ -8,7 +8,8 @@ from dataclasses import dataclass
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger, AstrBotConfig, StarTools
+import pathlib
+from astrbot.api import logger, AstrBotConfig
 
 DIARY_SYSTEM_PROMPT = """你是一个日记作者。请根据下方提供的聊天记录，撰写一篇日记。
 
@@ -45,7 +46,7 @@ class DailyNotePlugin(Star):
         super().__init__(context)
         self.config = config
 
-        data_dir = StarTools.get_data_dir()
+        data_dir = pathlib.Path("data") / "astrbot_plugin_daily_note"
         data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = str(data_dir / "daily_note.db")
 
