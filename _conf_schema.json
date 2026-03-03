@@ -1,7 +1,9 @@
 {
   "provider": {
+    "type": "string",
     "_special": "select_provider",
-    "description": "用于生成日记的模型提供商（留空则使用当前会话默认模型）"
+    "description": "用于生成日记的模型提供商（留空则使用当前会话默认模型）",
+    "default": ""
   },
   "interval_days": {
     "description": "每隔多少天自动总结一次",
