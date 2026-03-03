@@ -25,7 +25,7 @@
 3. 点击 **安装插件**，输入本仓库地址：
 
 ```
-https://github.com/your_name/astrbot_plugin_daily_note
+https://github.com/976230600/astrbot_plugin_daily_note
 ```
 
 ### 方式二：手动安装
@@ -34,7 +34,7 @@ https://github.com/your_name/astrbot_plugin_daily_note
 
 ```bash
 cd /path/to/AstrBot/data/plugins
-git clone https://github.com/your_name/astrbot_plugin_daily_note.git
+git clone https://github.com/976230600/astrbot_plugin_daily_note.git
 ```
 
 然后在 AstrBot 管理面板的插件管理页面点击 **重载插件**。
@@ -87,7 +87,7 @@ Bot:  [ 和朋友聊了新电影 ]
 
 ## 数据存储
 
-日记数据保存在 AstrBot 的 `data/daily_note.db`（SQLite 数据库），不在插件自身目录内，插件更新或重装不会丢失数据。
+日记数据保存在 AstrBot 的 `data/astrbot_plugin_daily_note/daily_note.db`（SQLite 数据库），位于插件专属数据目录中，插件更新或重装不会丢失数据。
 
 ## 许可证
 
