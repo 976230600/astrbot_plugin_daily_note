@@ -28,6 +28,10 @@ DIARY_SYSTEM_PROMPT = (
 MAX_TITLE_LEN = 20
 TITLE_SANITIZE_RE = re.compile(r"[^\w\u4e00-\u9fff\u3400-\u4dbf\s]")
 
+_FALLBACK_WAIT_SEC = 3600.0
+_MAX_LOCK_POOL_SIZE = 500
+_CLEANUP_INTERVAL_SEC = 86400
+
 
 @dataclass
 class NoteRecord:
@@ -54,6 +58,17 @@ class DailyNotePlugin(Star):
 
         self._init_db()
         self._schedule_task: asyncio.Task | None = None
+        self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    def _get_session_lock(self, umo: str, cid: str) -> asyncio.Lock:
+        key = (umo, cid)
+        if key not in self._session_locks:
+            if len(self._session_locks) > _MAX_LOCK_POOL_SIZE:
+                idle = [k for k, v in self._session_locks.items() if not v.locked()]
+                for k in idle:
+                    del self._session_locks[k]
+            self._session_locks[key] = asyncio.Lock()
+        return self._session_locks[key]
 
     # ── 数据库初始化与迁移 ────────────────────────────────
 
@@ -70,6 +85,12 @@ class DailyNotePlugin(Star):
                     created_at INTEGER NOT NULL
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS schedule_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )"""
+            )
             self._migrate_columns(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_notes_umo_cid_time "
@@ -78,7 +99,6 @@ class DailyNotePlugin(Star):
 
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection):
-        """兼容旧版数据库：检测并添加缺失的列。"""
         existing = {
             row[1] for row in conn.execute("PRAGMA table_info(daily_notes)").fetchall()
         }
@@ -87,6 +107,22 @@ class DailyNotePlugin(Star):
         if "history_count" not in existing:
             conn.execute(
                 "ALTER TABLE daily_notes ADD COLUMN history_count INTEGER NOT NULL DEFAULT 0"
+            )
+
+    # ── 状态持久化 ────────────────────────────────────────
+
+    def _get_state(self, key: str) -> str | None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM schedule_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def _set_state(self, key: str, value: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO schedule_state (key, value) VALUES (?, ?)",
+                (key, value),
             )
 
     # ── 定时任务 ─────────────────────────────────────────
@@ -102,23 +138,39 @@ class DailyNotePlugin(Star):
         self._schedule_task = asyncio.create_task(self._schedule_loop())
 
     def _calc_next_trigger(self) -> float:
-        """计算距离下一个触发时刻的秒数。
+        """基于持久化的上次触发时间计算下次触发，重启后不丢失间隔。
 
-        根据 generate_hour 和 interval_days 确定下一个目标时间点。
+        内部异常时回退到安全默认值，确保调度线程不会崩溃。
         """
-        hour = max(0, min(23, self.config.get("generate_hour", 22)))
-        interval_days = max(self.config.get("interval_days", 1), 1)
+        try:
+            hour = max(0, min(23, self.config.get("generate_hour", 22)))
+            interval_days = max(self.config.get("interval_days", 1), 1)
 
-        now = datetime.now()
-        today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            now = datetime.now()
+            today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
 
-        if now >= today_target:
-            next_target = today_target + timedelta(days=interval_days)
-        else:
-            next_target = today_target
+            last_trigger_str = self._get_state("last_trigger_time")
+            if last_trigger_str:
+                last_dt = datetime.fromtimestamp(float(last_trigger_str))
+                next_target = last_dt.replace(
+                    hour=hour, minute=0, second=0, microsecond=0
+                ) + timedelta(days=interval_days)
+                while next_target <= now:
+                    next_target += timedelta(days=interval_days)
+            else:
+                next_target = (
+                    today_target
+                    if today_target > now
+                    else today_target + timedelta(days=interval_days)
+                )
 
-        wait_sec = (next_target - now).total_seconds()
-        return max(wait_sec, 60)
+            return max((next_target - now).total_seconds(), 60)
+        except Exception as e:
+            logger.error(
+                f"[daily_note] 计算下次触发时间出错: {e}，"
+                f"{_FALLBACK_WAIT_SEC / 3600:.0f} 小时后重试"
+            )
+            return _FALLBACK_WAIT_SEC
 
     async def _schedule_loop(self):
         while True:
@@ -127,136 +179,204 @@ class DailyNotePlugin(Star):
                 f"[daily_note] 下次自动生成将在 {wait_sec / 3600:.1f} 小时后触发"
             )
             await asyncio.sleep(wait_sec)
+
+            should_cleanup = True
+            last_cleanup_str = self._get_state("last_cleanup_time")
+            if last_cleanup_str:
+                try:
+                    should_cleanup = (
+                        time.time() - float(last_cleanup_str) > _CLEANUP_INTERVAL_SEC
+                    )
+                except (ValueError, TypeError):
+                    pass
+            if should_cleanup:
+                try:
+                    await self._cleanup_orphan_notes()
+                    self._set_state("last_cleanup_time", str(time.time()))
+                except Exception as e:
+                    logger.error(f"[daily_note] 孤儿日记清理出错: {e}")
+
             try:
-                await self._generate_all_sessions()
+                gen, skip, fail = await self._generate_all_sessions()
+                if gen > 0 or fail == 0:
+                    self._set_state("last_trigger_time", str(time.time()))
+                if gen > 0:
+                    logger.info(
+                        f"[daily_note] 本轮完成：生成 {gen}，跳过 {skip}，失败 {fail}"
+                    )
+                elif fail > 0:
+                    logger.warning(
+                        f"[daily_note] 本轮生成失败 {fail} 个会话"
+                        f"（跳过 {skip}），不推进触发时间"
+                    )
+                else:
+                    logger.info(
+                        f"[daily_note] 本轮所有 {skip} 个会话均无新内容"
+                    )
             except Exception as e:
                 logger.error(f"[daily_note] 定时生成日记出错: {e}")
 
-    async def _generate_all_sessions(self):
+    async def _generate_all_sessions(self) -> tuple[int, int, int]:
+        """遍历所有会话生成日记，返回 (生成数, 跳过数, 失败数)。"""
         conv_mgr = self.context.conversation_manager
         conversations = await conv_mgr.get_conversations(
             platform_id=None, unified_msg_origin=None
         )
+        gen_count = 0
+        skip_count = 0
+        fail_count = 0
         for conv in conversations:
             umo = self._build_umo(conv)
             if not umo:
                 logger.warning(
                     f"[daily_note] 会话 cid={conv.cid} 无法构建 unified_msg_origin，跳过"
                 )
+                skip_count += 1
                 continue
             try:
-                await self._generate_note_for_conversation(
+                generated = await self._generate_note_for_conversation(
                     umo=umo,
                     cid=conv.cid,
                     persona_id=conv.persona_id,
-                    skip_dedup=False,
                 )
+                if generated:
+                    gen_count += 1
+                else:
+                    skip_count += 1
             except Exception as e:
+                fail_count += 1
                 logger.error(
                     f"[daily_note] 会话 cid={conv.cid} umo={umo} 生成失败: {e}"
                 )
+        return gen_count, skip_count, fail_count
 
     @staticmethod
     def _build_umo(conv) -> str | None:
         """从 Conversation 对象推导 unified_msg_origin。
 
-        优先使用 platform_id（在 AstrBot 的 Conversation 表中，
-        platform_id 存储的就是完整的 unified_msg_origin 字符串）。
+        优先尝试 conv 自身的 unified_msg_origin 属性（若存在），
+        回退到 platform_id（AstrBot 当前版本中存储的就是完整 umo）。
         """
+        umo = getattr(conv, "unified_msg_origin", None)
+        if umo:
+            return umo
         if conv.platform_id:
             return conv.platform_id
         return None
 
-    # ── 日记生成核心 ──────────────────────────────────────
+    # ── 日记生成核心（纯增量模型） ────────────────────────
 
     async def _generate_note_for_conversation(
         self,
         umo: str,
         cid: str,
         persona_id: str | None,
-        skip_dedup: bool = False,
+        force: bool = False,
     ) -> bool:
-        """为指定会话生成日记。返回 True 表示成功生成，False 表示跳过或无内容。"""
-        conv_mgr = self.context.conversation_manager
-        conversation = await conv_mgr.get_conversation(
-            unified_msg_origin=umo, conversation_id=cid
-        )
-        if not conversation or not conversation.history:
-            return False
+        """纯增量生成：只处理 history_end 之后的新消息，全量送入 LLM。
 
-        history = conversation.history
-        if isinstance(history, str):
-            try:
-                history = json.loads(history)
-            except json.JSONDecodeError:
+        force=True 时忽略增量检查，基于全部历史重新生成。
+        """
+        async with self._get_session_lock(umo, cid):
+            conv_mgr = self.context.conversation_manager
+            conversation = await conv_mgr.get_conversation(
+                unified_msg_origin=umo, conversation_id=cid
+            )
+            if not conversation or not conversation.history:
+                return False
+
+            history = conversation.history
+            if isinstance(history, str):
+                try:
+                    history = json.loads(history)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"[daily_note] cid={cid} history 非有效 JSON，跳过该会话"
+                    )
+                    return False
+
+            if not isinstance(history, list):
                 logger.warning(
-                    f"[daily_note] cid={cid} history 非有效 JSON，按原始字符串处理"
-                )
-
-        if isinstance(history, list):
-            current_count = len(history)
-        else:
-            current_count = len(str(history))
-
-        if not skip_dedup and self._should_skip(umo, cid, current_count):
-            return False
-
-        max_messages = max(self.config.get("max_messages", 50), 1)
-        if isinstance(history, list):
-            recent = history[-max_messages:]
-            chat_text = self._format_history(recent)
-        else:
-            chat_text = str(history)[-6000:]
-
-        if not chat_text.strip():
-            return False
-
-        persona_prompt = "（无特定人格，使用默认自然风格）"
-        if persona_id:
-            try:
-                persona = await self.context.persona_manager.get_persona(
-                    persona_id
-                )
-                if persona and persona.system_prompt:
-                    persona_prompt = persona.system_prompt
-            except Exception as e:
-                logger.warning(
-                    f"[daily_note] 获取人格 persona_id={persona_id} 失败: {e}，使用默认风格"
-                )
-
-        custom_prompt = self.config.get("custom_prompt", "")
-        custom_section = f"\n额外风格要求：{custom_prompt}" if custom_prompt else ""
-
-        system_prompt = (
-            DIARY_SYSTEM_PROMPT
-            .replace("$PERSONA_PROMPT$", persona_prompt)
-            .replace("$CUSTOM_PROMPT$", custom_section)
-        )
-
-        provider_id = self.config.get("provider", "")
-        if not provider_id:
-            try:
-                provider_id = await self.context.get_current_chat_provider_id(
-                    umo=umo
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[daily_note] umo={umo} 无法获取默认 provider: {e}，跳过"
+                    f"[daily_note] cid={cid} history 格式异常"
+                    f"（类型 {type(history).__name__}），跳过该会话"
                 )
                 return False
 
-        full_prompt = f"{system_prompt}\n\n以下是需要总结为日记的聊天记录：\n\n{chat_text}"
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=full_prompt,
-        )
+            total_count = len(history)
+            last_end = 0 if force else self._get_last_history_end(umo, cid)
 
-        resp_text = llm_resp.completion_text or ""
-        title, content = self._parse_llm_response(resp_text)
-        title = self._sanitize_title(title)
-        self._save_note(title, content, umo, cid, current_count)
-        logger.info(f"[daily_note] 为 umo={umo} cid={cid} 生成日记: {title}")
-        return True
+            if total_count < last_end:
+                logger.info(
+                    f"[daily_note] umo={umo} cid={cid} 检测到上下文压缩"
+                    f"（当前 {total_count} 条 < 上次 {last_end} 条），重置基线"
+                )
+                last_end = 0
+
+            if total_count <= last_end:
+                return False
+
+            min_messages = max(self.config.get("min_messages", 3), 1)
+            new_messages = history[last_end:]
+            if not force and len(new_messages) < min_messages:
+                logger.info(
+                    f"[daily_note] umo={umo} cid={cid} 新消息不足"
+                    f"（{len(new_messages)} 条 < 最低 {min_messages} 条），跳过"
+                )
+                return False
+
+            chat_text = self._format_history(new_messages)
+            if not chat_text.strip():
+                return False
+
+            persona_prompt = "（无特定人格，使用默认自然风格）"
+            if persona_id:
+                try:
+                    persona = await self.context.persona_manager.get_persona(
+                        persona_id
+                    )
+                    if persona and persona.system_prompt:
+                        persona_prompt = persona.system_prompt
+                except Exception as e:
+                    logger.warning(
+                        f"[daily_note] 获取人格 persona_id={persona_id} 失败: {e}，"
+                        "使用默认风格"
+                    )
+
+            custom_prompt = self.config.get("custom_prompt", "")
+            custom_section = f"\n额外风格要求：{custom_prompt}" if custom_prompt else ""
+
+            system_prompt = (
+                DIARY_SYSTEM_PROMPT
+                .replace("$PERSONA_PROMPT$", persona_prompt)
+                .replace("$CUSTOM_PROMPT$", custom_section)
+            )
+
+            provider_id = self.config.get("provider", "")
+            if not provider_id:
+                try:
+                    provider_id = await self.context.get_current_chat_provider_id(
+                        umo=umo
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"无法获取模型提供商: {e}") from e
+
+            full_prompt = (
+                f"{system_prompt}\n\n以下是需要总结为日记的聊天记录：\n\n{chat_text}"
+            )
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=full_prompt,
+            )
+
+            resp_text = llm_resp.completion_text or ""
+            if not resp_text.strip():
+                raise RuntimeError("LLM 返回空内容")
+
+            title, content = self._parse_llm_response(resp_text)
+            title = self._sanitize_title(title)
+            self._save_note(title, content, umo, cid, total_count)
+            logger.info(f"[daily_note] 为 umo={umo} cid={cid} 生成日记: {title}")
+            return True
 
     @staticmethod
     def _format_history(messages: list) -> str:
@@ -282,21 +402,17 @@ class DailyNotePlugin(Star):
 
     @staticmethod
     def _parse_llm_response(text: str) -> tuple[str, str]:
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
-
-        try:
-            data = json.loads(text)
-            title = str(data.get("title", "无题日记")).strip()
-            content = str(data.get("content", text)).strip()
-        except json.JSONDecodeError:
-            title = f"日记_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            content = text
-        return title, content
+        raw = text.strip()
+        json_match = re.search(r"\{[\s\S]*\}", raw)
+        if json_match:
+            try:
+                data = json.loads(json_match.group())
+                title = str(data.get("title", "无题日记")).strip()
+                content = str(data.get("content", raw)).strip()
+                return title, content
+            except json.JSONDecodeError:
+                pass
+        return f"日记_{datetime.now().strftime('%Y%m%d_%H%M%S')}", raw
 
     @staticmethod
     def _sanitize_title(title: str) -> str:
@@ -307,14 +423,10 @@ class DailyNotePlugin(Star):
             title = f"日记_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         return title
 
-    # ── 去重判断 ──────────────────────────────────────────
+    # ── 增量追踪 ──────────────────────────────────────────
 
-    def _should_skip(self, umo: str, cid: str, current_count: int) -> bool:
-        """检查该会话是否需要跳过生成。
-
-        条件：如果该会话（umo+cid）最近一篇日记记录的 history_count
-        与当前聊天记录条数相同，说明没有新消息，跳过生成。
-        """
+    def _get_last_history_end(self, umo: str, cid: str) -> int:
+        """获取该会话最近一篇日记的 history_end（即上次消费到的位置）。"""
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT history_count FROM daily_notes "
@@ -322,42 +434,60 @@ class DailyNotePlugin(Star):
                 "ORDER BY created_at DESC LIMIT 1",
                 (umo, cid),
             ).fetchone()
+        return row[0] if row else 0
 
-        if row is None:
-            return False
+    # ── 孤儿日记清理 ──────────────────────────────────────
 
-        last_count = row[0]
-        if current_count <= last_count:
-            logger.info(
-                f"[daily_note] umo={umo} cid={cid} 无新消息"
-                f"（当前 {current_count} 条，上次 {last_count} 条），跳过"
-            )
-            return True
-        return False
+    async def _cleanup_orphan_notes(self):
+        """清理已不存在的会话所对应的日记。"""
+        conv_mgr = self.context.conversation_manager
+
+        with sqlite3.connect(self.db_path) as conn:
+            pairs = conn.execute(
+                "SELECT DISTINCT unified_msg_origin, cid FROM daily_notes"
+            ).fetchall()
+
+        for umo, cid in pairs:
+            try:
+                conv = await conv_mgr.get_conversation(
+                    unified_msg_origin=umo, conversation_id=cid
+                )
+                if not conv:
+                    self._delete_notes_by_conversation(umo, cid)
+                    logger.info(
+                        f"[daily_note] 清理孤儿日记 umo={umo} cid={cid}"
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"[daily_note] 检查会话存在性出错 umo={umo} cid={cid}: {e}"
+                )
 
     # ── 数据库操作 ────────────────────────────────────────
 
     def _save_note(
-        self, title: str, content: str, umo: str, cid: str, history_count: int
+        self, title: str, content: str, umo: str, cid: str, history_end: int
     ):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO daily_notes "
                 "(title, content, unified_msg_origin, cid, history_count, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (title, content, umo, cid, history_count, int(time.time())),
+                (title, content, umo, cid, history_end, int(time.time())),
             )
 
-    def _get_notes_list(self, umo: str) -> list[tuple[int, str, int]]:
+    def _get_notes_list(self, umo: str, cid: str) -> list[tuple[int, str, int]]:
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(
                 "SELECT id, title, created_at FROM daily_notes "
-                "WHERE unified_msg_origin = ? ORDER BY created_at DESC",
-                (umo,),
+                "WHERE unified_msg_origin = ? AND cid = ? "
+                "ORDER BY created_at DESC",
+                (umo, cid),
             ).fetchall()
 
-    def _get_note_by_dynamic_index(self, umo: str, index: int) -> NoteRecord | None:
-        notes = self._get_notes_list(umo)
+    def _get_note_by_dynamic_index(
+        self, umo: str, cid: str, index: int
+    ) -> NoteRecord | None:
+        notes = self._get_notes_list(umo, cid)
         if 1 <= index <= len(notes):
             db_id = notes[index - 1][0]
             with sqlite3.connect(self.db_path) as conn:
@@ -369,6 +499,28 @@ class DailyNotePlugin(Star):
                 return NoteRecord(title=row[0], content=row[1], created_at=row[2])
         return None
 
+    def _delete_note_by_dynamic_index(
+        self, umo: str, cid: str, index: int
+    ) -> str | None:
+        """按动态编号删除日记，返回被删除日记的标题，不存在返回 None。"""
+        notes = self._get_notes_list(umo, cid)
+        if 1 <= index <= len(notes):
+            db_id, title, _ = notes[index - 1]
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM daily_notes WHERE id = ?", (db_id,))
+            return title
+        return None
+
+    def _delete_notes_by_conversation(self, umo: str, cid: str) -> int:
+        """删除指定会话 (umo+cid) 下的所有日记，返回删除数量。"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM daily_notes "
+                "WHERE unified_msg_origin = ? AND cid = ?",
+                (umo, cid),
+            )
+            return cursor.rowcount
+
     # ── 管理员指令 ────────────────────────────────────────
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -379,8 +531,11 @@ class DailyNotePlugin(Star):
         event.stop_event()
         umo = event.unified_msg_origin
 
+        conv_mgr = self.context.conversation_manager
+        cid = await conv_mgr.get_curr_conversation_id(umo)
+
         if index == 0:
-            notes = self._get_notes_list(umo)
+            notes = self._get_notes_list(umo, cid)
             if not notes:
                 yield event.plain_result("暂无日记记录。")
                 return
@@ -394,9 +549,9 @@ class DailyNotePlugin(Star):
             lines.append("使用 /daily_note <编号> 查看完整内容")
             yield event.plain_result("\n".join(lines))
         else:
-            note = self._get_note_by_dynamic_index(umo, index)
+            note = self._get_note_by_dynamic_index(umo, cid, index)
             if note is None:
-                total = len(self._get_notes_list(umo))
+                total = len(self._get_notes_list(umo, cid))
                 if total == 0:
                     yield event.plain_result("暂无日记记录。")
                 else:
@@ -409,10 +564,11 @@ class DailyNotePlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("daily_note_gen")
-    async def cmd_daily_note_gen(self, event: AstrMessageEvent):
-        '''手动触发为当前会话生成一篇日记'''
+    async def cmd_daily_note_gen(self, event: AstrMessageEvent, mode: str = ""):
+        '''手动触发为当前会话生成一篇日记。加 force 参数可忽略增量检查强制生成'''
         event.stop_event()
         umo = event.unified_msg_origin
+        force = mode.strip().lower() == "force"
 
         conv_mgr = self.context.conversation_manager
         cid = await conv_mgr.get_curr_conversation_id(umo)
@@ -430,19 +586,69 @@ class DailyNotePlugin(Star):
                 umo=umo,
                 cid=cid,
                 persona_id=conversation.persona_id,
-                skip_dedup=True,
+                force=force,
             )
             if generated:
-                notes = self._get_notes_list(umo)
+                notes = self._get_notes_list(umo, cid)
                 latest_title = notes[0][1] if notes else "未知"
                 yield event.plain_result(
                     f"日记生成成功：{latest_title}\n使用 /daily_note 1 查看内容"
                 )
+            elif force:
+                yield event.plain_result(
+                    "当前会话无有效聊天内容，未能生成日记。"
+                )
             else:
-                yield event.plain_result("当前会话无有效聊天内容，未生成日记。")
+                yield event.plain_result(
+                    "当前会话没有新的聊天记录，无需生成日记。\n"
+                    "如需强制重新生成，请使用 /daily_note_gen force"
+                )
         except Exception as e:
             logger.error(f"[daily_note] 手动生成失败 umo={umo} cid={cid}: {e}")
             yield event.plain_result(f"生成失败：{e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("daily_note_del")
+    async def cmd_daily_note_del(self, event: AstrMessageEvent, index: int = 0):
+        '''删除指定编号的日记'''
+        event.stop_event()
+        umo = event.unified_msg_origin
+
+        conv_mgr = self.context.conversation_manager
+        cid = await conv_mgr.get_curr_conversation_id(umo)
+
+        if index < 1:
+            yield event.plain_result("请指定要删除的日记编号，如 /daily_note_del 1")
+            return
+
+        title = self._delete_note_by_dynamic_index(umo, cid, index)
+        if title is None:
+            total = len(self._get_notes_list(umo, cid))
+            if total == 0:
+                yield event.plain_result("暂无日记记录。")
+            else:
+                yield event.plain_result(
+                    f"编号 {index} 不存在，当前共 {total} 篇日记（编号范围 1-{total}）。"
+                )
+            return
+
+        yield event.plain_result(f"已删除日记 #{index}：{title}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("daily_note_clear")
+    async def cmd_daily_note_clear(self, event: AstrMessageEvent):
+        '''清空当前会话的所有日记'''
+        event.stop_event()
+        umo = event.unified_msg_origin
+
+        conv_mgr = self.context.conversation_manager
+        cid = await conv_mgr.get_curr_conversation_id(umo)
+
+        count = self._delete_notes_by_conversation(umo, cid)
+        if count == 0:
+            yield event.plain_result("暂无日记记录，无需清空。")
+        else:
+            yield event.plain_result(f"已清空 {count} 篇日记。")
 
     # ── 插件卸载 ──────────────────────────────────────────
 

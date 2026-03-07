@@ -17,11 +17,11 @@
     "default": 22,
     "hint": "设置自动生成日记的时间点，默认 22 点（晚上 10 点）。范围 0-23"
   },
-  "max_messages": {
-    "description": "每次总结最近多少条聊天记录",
+  "min_messages": {
+    "description": "最少多少条新消息才自动生成日记",
     "type": "int",
-    "default": 50,
-    "hint": "控制每次送入大模型总结的聊天记录条数上限"
+    "default": 3,
+    "hint": "如果自上次生成日记以来的新消息条数不足此值，则跳过生成。设为 1 表示有新消息就生成"
   },
   "custom_prompt": {
     "description": "自定义日记生成提示词（可选）",
